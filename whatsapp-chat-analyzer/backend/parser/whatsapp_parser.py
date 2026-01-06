@@ -1,0 +1,171 @@
+import re
+import pandas as pd
+import logging
+from typing import List, Dict, Any
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Regex to parse a WhatsApp chat line
+# Handles both 12-hour and 24-hour time formats, with or without seconds.
+# Example: [31/12/2023, 10:00:05 PM] John Doe: Message
+# Example: [11/19/25, 6:41:43 PM] Sa-fe-Spa-ciooo⭐️: Message
+# Example: [1/1/24, 10:00] Jane Doe: Message
+# Example: 31/12/2023, 10:00 - John Doe: Message (older format)
+WHATSAPP_CHAT_REGEX = re.compile(
+    r"\[(\d{1,2}/\d{1,2}/\d{2,4}, \d{1,2}:\d{2}(:\d{2})?( [AP]M)?)\] ([^:]+): (.*)",
+    re.IGNORECASE
+)
+
+# Alternative regex for older format with hyphen instead of brackets
+WHATSAPP_LEGACY_REGEX = re.compile(
+    r"(\d{1,2}/\d{1,2}/\d{2,4}, \d{1,2}:\d{2}(:\d{2})?( [AP]M)?) - ([^:]+): (.*)",
+    re.IGNORECASE
+)
+
+# Regex for system messages like "Messages are end-to-end encrypted"
+SYSTEM_MESSAGE_REGEX = re.compile(
+    r"\[(\d{1,2}/\d{1,2}/\d{2,4}, \d{1,2}:\d{2}(:\d{2})?( [AP]M)?)\] ([^:]+): ‎(.+)"
+)
+
+MEDIA_OMITTED_MSG = "<Media omitted>"
+
+def parse_chat_file(file_path: str) -> pd.DataFrame:
+    """
+    Parses a WhatsApp chat export file (.txt).
+
+    Args:
+        file_path: The path to the chat file.
+
+    Returns:
+        A pandas DataFrame with columns: timestamp, sender, message, message_type, media_filename.
+    """
+    logger.info(f"📖 Starting to parse chat file: {file_path}")
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        logger.info(f"✅ Successfully read {len(lines)} lines from file")
+    except Exception as e:
+        logger.error(f"❌ Error reading file: {e}")
+        return pd.DataFrame()
+    
+    # Log first few lines to help debug format issues
+    if lines:
+        logger.info("📝 First 5 lines of the chat file:")
+        for i, line in enumerate(lines[:5], 1):
+            logger.info(f"   Line {i}: {line.strip()[:100]}")
+
+    chat_data: List[Dict[str, Any]] = []
+    current_message_lines: List[str] = []
+    matched_count = 0
+    unmatched_count = 0
+    
+    for line in lines:
+        # Try matching the modern bracket format first: [DD/MM/YY, HH:MM:SS AM/PM] Name: Message
+        match = WHATSAPP_CHAT_REGEX.match(line)
+        
+        if not match:
+            # Try the legacy format with hyphen: DD/MM/YY, HH:MM AM/PM - Name: Message
+            match = WHATSAPP_LEGACY_REGEX.match(line)
+        
+        # Check for system messages (special invisible character after colon)
+        system_match = SYSTEM_MESSAGE_REGEX.match(line) if not match else None
+
+        if match:
+            matched_count += 1
+            # If we have a pending multi-line message, save it first
+            if current_message_lines:
+                chat_data[-1]['message'] += ' '.join(current_message_lines)
+                current_message_lines = []
+
+            # Extract data from the matched line
+            # Groups: (timestamp, optional_seconds, optional_AM/PM, sender, message)
+            timestamp_str = match.group(1)
+            sender = match.group(4)
+            message_text = match.group(5).strip()
+
+            message_type = "text"
+            media_filename = None
+
+            if MEDIA_OMITTED_MSG in message_text:
+                message_type = "media"
+                message_text = ""
+            elif "(file attached)" in message_text:
+                parts = message_text.split("(file attached)")
+                media_filename = parts[0].strip()
+                message_text = ""
+                message_type = "voice_note" if ".opus" in media_filename else "media"
+            
+            chat_data.append({
+                "timestamp_str": timestamp_str,
+                "sender": sender,
+                "message": message_text,
+                "message_type": message_type,
+                "media_filename": media_filename,
+            })
+        elif system_match:
+            matched_count += 1
+            if current_message_lines:
+                chat_data[-1]['message'] += ' '.join(current_message_lines)
+                current_message_lines = []
+            # This is a system message (e.g., "Messages are end-to-end encrypted")
+            timestamp_str = system_match.group(1)
+            sender = system_match.group(4)
+            message_text = system_match.group(5).strip()
+            
+            chat_data.append({
+                "timestamp_str": timestamp_str,
+                "sender": "System",
+                "message": message_text,
+                "message_type": "system",
+                "media_filename": None,
+            })
+
+        elif chat_data:
+            # This is a continuation of the previous message (multi-line)
+            current_message_lines.append(line.strip())
+        else:
+            unmatched_count += 1
+
+    # Add the last multi-line message if it exists
+    if current_message_lines and chat_data:
+        chat_data[-1]['message'] += ' '.join(current_message_lines)
+
+    logger.info(f"📊 Parsing complete:")
+    logger.info(f"   ✅ Matched lines: {matched_count}")
+    logger.info(f"   ⚠️  Unmatched lines: {unmatched_count}")
+    logger.info(f"   📝 Total messages parsed: {len(chat_data)}")
+    
+    if not chat_data:
+        logger.error("❌ No messages were parsed! The file format may not be recognized.")
+        logger.error("💡 Expected format examples:")
+        logger.error("   [31/12/2023, 10:00:05 PM] John Doe: Message")
+        logger.error("   31/12/2023, 10:00 - John Doe: Message")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(chat_data)
+    logger.info(f"✅ Created DataFrame with {len(df)} rows")
+    
+    # Convert timestamp string to datetime object
+    # The format can vary, so we let pandas infer it, but provide hints
+    try:
+        df['timestamp'] = pd.to_datetime(df['timestamp_str'], errors='coerce')
+    except Exception as e:
+        logger.warning(f"⚠️  Using fallback timestamp parsing: {e}")
+        df['timestamp'] = pd.to_datetime(df['timestamp_str'], errors='coerce', format='mixed')
+
+    # Count how many timestamps failed to parse
+    null_timestamps = df['timestamp'].isna().sum()
+    if null_timestamps > 0:
+        logger.warning(f"⚠️  {null_timestamps} timestamps could not be parsed and will be dropped")
+
+    df = df.dropna(subset=['timestamp']) # Drop rows where timestamp could not be parsed
+    logger.info(f"✅ After timestamp parsing: {len(df)} rows remain")
+    
+    df = df.sort_values(by="timestamp").reset_index(drop=True)
+    df = df.drop(columns=['timestamp_str'])
+
+    logger.info(f"🎉 Parsing successful! Returning DataFrame with {len(df)} messages")
+    return df[["timestamp", "sender", "message", "message_type", "media_filename"]]
